@@ -1,0 +1,12 @@
+{
+  "name": "bsp-licensing-webhook",
+  "private": true,
+  "version": "1.0.0",
+  "main": "index.js",
+  "engines": { "node": ">=18" },
+  "scripts": { "start": "node index.js" },
+  "dependencies": {
+    "express": "^4.19.2",
+    "stripe": "^16.6.0"
+  }
+}
