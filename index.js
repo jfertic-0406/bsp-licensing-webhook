@@ -10,7 +10,7 @@ const app = express();
 // -------------------- Config --------------------
 const PORT = process.env.PORT || 8080;
 
-// Change this every commit so /status proves you’re on the latest revision
+// bump this each commit if you want
 const BUILD_STAMP = '2026-02-19-02';
 
 // Stripe env vars
@@ -20,10 +20,9 @@ const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;   // whsec_...
 if (!STRIPE_SECRET) console.warn('[WARN] Missing env var STRIPE_SECRET');
 if (!STRIPE_WEBHOOK_SECRET) console.warn('[WARN] Missing env var STRIPE_WEBHOOK_SECRET');
 
-// Only create Stripe client if secret exists (prevents crashes during deploy)
 const stripe = STRIPE_SECRET ? Stripe(STRIPE_SECRET) : null;
 
-// Firestore (Cloud Run uses Service Account automatically via ADC)
+// Firestore (Cloud Run uses service account automatically via ADC)
 const firestore = new Firestore();
 
 // -------------------- Helpers --------------------
@@ -35,10 +34,6 @@ function makeLicenseKey() {
 
 function nowIso() {
   return new Date().toISOString();
-}
-
-function sha256Hex(s) {
-  return crypto.createHash('sha256').update(String(s || ''), 'utf8').digest('hex');
 }
 
 // -------------------- Routes --------------------
@@ -55,12 +50,10 @@ app.get('/status', (req, res) => {
   });
 });
 
-/**
- * ================== STRIPE WEBHOOK ==================
- * IMPORTANT:
- * - Stripe requires RAW body for signature verification
- * - Do NOT use express.json() on this route
- */
+// -------------------- STRIPE WEBHOOK --------------------
+// IMPORTANT:
+// Stripe requires RAW body for signature verification.
+// Do NOT use express.json() on this route.
 app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
   try {
     if (!stripe) {
@@ -73,10 +66,7 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
     }
 
     const sig = req.headers['stripe-signature'];
-    if (!sig) {
-      console.error('[ERROR] Missing stripe-signature header.');
-      return res.status(400).send('Missing stripe-signature');
-    }
+    if (!sig) return res.status(400).send('Missing stripe-signature');
 
     let event;
     try {
@@ -96,7 +86,7 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
 
       const metadata = session.metadata || {};
 
-      // Idempotency: store Stripe event id so resends don't create new licenses
+      // idempotency by Stripe event.id
       const eventRef = firestore.collection('stripe_events').doc(event.id);
 
       await firestore.runTransaction(async (tx) => {
@@ -104,13 +94,11 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
         if (existing.exists) return;
 
         const licenseKey = makeLicenseKey();
-        const emailHash = email ? sha256Hex(email.trim().toLowerCase()) : null;
 
         const licenseDoc = {
           licenseKey,
-          provider: 'stripe',
           email,
-          emailHash,
+          provider: 'stripe',
           stripe: {
             eventId: event.id,
             sessionId: session.id,
@@ -132,7 +120,6 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
           type: event.type,
           sessionId: session.id,
           email,
-          emailHash,
           licenseKey,
         });
 
@@ -155,70 +142,69 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
   }
 });
 
-// JSON parser for everything AFTER the Stripe raw route
-app.use(express.json());
-
-/**
- * ================== PAYPAL WEBHOOK ==================
- * For the PayPal Webhooks Simulator, we accept JSON and write to Firestore.
- * (Later we can add PayPal signature verification; the Simulator events are mock anyway.)
- */
-app.post('/webhook/paypal', async (req, res) => {
+// -------------------- PAYPAL WEBHOOK --------------------
+// PayPal sends JSON. Simulator events do NOT include everything needed for full verification.
+// For now: accept JSON and mint license based on event.id (WH-...).
+app.post('/webhook/paypal', express.json({ type: '*/*' }), async (req, res) => {
   try {
     const body = req.body || {};
-    const eventId = body.id || null;
     const eventType = body.event_type || null;
-    const resourceType = body.resource_type || null;
-    const createTime = body.create_time || null;
-    const summary = body.summary || null;
-    const resource = body.resource || {};
+    const eventId = body.id || null;
 
     if (!eventId || !eventType) {
-      console.error('[PayPal] Missing event id/type');
-      return res.status(400).json({ ok: false, error: 'Missing event id/type' });
+      return res.status(400).json({ ok: false, error: 'Missing PayPal event id/type' });
     }
 
-    // Try to extract useful purchase identifiers
-    const captureId = resource.id || null;
-    const orderId =
-      resource?.supplementary_data?.related_ids?.order_id ||
+    // These are "paid" events (mint license)
+    const PAID_EVENTS = new Set([
+      'PAYMENT.CAPTURE.COMPLETED',
+      'PAYMENT.SALE.COMPLETED',
+    ]);
+
+    const resource = body.resource || {};
+
+    // CAPTURE: amount.value + currency_code
+    // SALE: amount.total + currency
+    const amountStr =
+      resource.amount?.value ??
+      resource.amount?.total ??
       null;
 
-    const amountValue = resource?.amount?.value || null;
-    const currencyCode = resource?.amount?.currency_code || null;
-
-    const payerEmail =
-      resource?.payer?.email_address ||
-      resource?.payer?.email ||
+    const currency =
+      resource.amount?.currency_code ??
+      resource.amount?.currency ??
       null;
 
-    const email = payerEmail || null;
-    const emailHash = email ? sha256Hex(email.trim().toLowerCase()) : null;
+    const amount = amountStr != null ? Number(amountStr) : null;
 
-    // Idempotency: PayPal event id de-dupe
-    const ppEventRef = firestore.collection('paypal_events').doc(eventId);
+    // Store every PayPal event for audit/debug
+    const eventRef = firestore.collection('paypal_events').doc(eventId);
 
+    if (!PAID_EVENTS.has(eventType)) {
+      await eventRef.set({ receivedAt: nowIso(), eventType, raw: body }, { merge: true });
+      return res.status(200).json({ ok: true, ignored: true, eventType });
+    }
+
+    // Idempotency: one license per PayPal event id
     await firestore.runTransaction(async (tx) => {
-      const existing = await tx.get(ppEventRef);
+      const existing = await tx.get(eventRef);
       if (existing.exists) return;
 
       const licenseKey = makeLicenseKey();
 
       const licenseDoc = {
         licenseKey,
+        email: null,          // PayPal webhooks often don't include buyer email (especially simulator)
         provider: 'paypal',
-        email,
-        emailHash,
         paypal: {
           eventId,
           eventType,
-          resourceType,
-          createTime,
-          summary,
-          captureId,
-          orderId,
-          amount: amountValue ? Number(amountValue) : null,
-          currency: currencyCode,
+          resourceType: body.resource_type || null,
+          summary: body.summary || null,
+          amount,
+          currency,
+          captureId: resource.id || null,
+          createTime: resource.create_time || body.create_time || null,
         },
         status: 'active',
         createdAt: nowIso(),
@@ -226,36 +212,36 @@ app.post('/webhook/paypal', async (req, res) => {
         expiresAt: null,
       };
 
-      tx.set(ppEventRef, {
+      tx.set(eventRef, {
         processedAt: nowIso(),
         eventType,
-        resourceType,
-        captureId,
-        orderId,
-        email,
-        emailHash,
+        amount,
+        currency,
         licenseKey,
       });
 
       tx.set(firestore.collection('licenses').doc(licenseKey), licenseDoc, { merge: true });
     });
 
-    console.log('✅ PayPal event processed', { eventId, eventType, email, captureId, orderId });
-
-    return res.sendStatus(200);
+    console.log('✅ PayPal paid event processed', { eventId, eventType, amount, currency });
+    return res.status(200).json({ ok: true });
   } catch (err) {
     console.error('🔥 PayPal webhook handler error:', err);
-    return res.status(500).send('Server error');
+    return res.status(500).json({ ok: false, error: 'Server error' });
   }
 });
 
-// For any accidental hits to unknown paths
+// Helpful: JSON parser for any future non-webhook JSON endpoints (placed AFTER Stripe raw route)
+app.use(express.json());
+
+// Catch-all 404 LAST
 app.use((req, res) => res.status(404).json({ ok: false, error: 'Not found' }));
 
 // -------------------- Start --------------------
 app.listen(PORT, () => {
   console.log(`bsp-licensing-webhook listening on ${PORT} (build ${BUILD_STAMP})`);
 });
+
 
 
 
