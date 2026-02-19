@@ -230,10 +230,138 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
 // For any accidental hits to unknown paths
 app.use((req, res) => res.status(404).json({ ok: false, error: 'Not found' }));
 
+// -------------------- PayPal Webhook --------------------
+// Uses JSON body (PayPal does not require raw body like Stripe)
+app.post('/webhook/paypal', express.json({ type: 'application/json' }), async (req, res) => {
+  try {
+    const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
+    const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
+    const PAYPAL_WEBHOOK_ID = process.env.PAYPAL_WEBHOOK_ID;
+
+    if (!PAYPAL_CLIENT_ID || !PAYPAL_CLIENT_SECRET || !PAYPAL_WEBHOOK_ID) {
+      console.error('[ERROR] Missing PayPal env vars (PAYPAL_CLIENT_ID/SECRET/WEBHOOK_ID)');
+      return res.status(500).send('Server misconfigured');
+    }
+
+    // Sandbox endpoint; later you’ll swap to api-m.paypal.com for live
+    const PAYPAL_API = 'https://api-m.sandbox.paypal.com';
+
+    // 1) Get access token
+    const tokenResp = await fetch(`${PAYPAL_API}/v1/oauth2/token`, {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Basic ' + Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString('base64'),
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: 'grant_type=client_credentials',
+    });
+
+    if (!tokenResp.ok) {
+      const t = await tokenResp.text();
+      console.error('[ERROR] PayPal token failed:', tokenResp.status, t);
+      return res.status(500).send('PayPal auth failed');
+    }
+
+    const { access_token } = await tokenResp.json();
+
+    // 2) Verify webhook signature
+    const verifyPayload = {
+      auth_algo: req.header('PAYPAL-AUTH-ALGO'),
+      cert_url: req.header('PAYPAL-CERT-URL'),
+      transmission_id: req.header('PAYPAL-TRANSMISSION-ID'),
+      transmission_sig: req.header('PAYPAL-TRANSMISSION-SIG'),
+      transmission_time: req.header('PAYPAL-TRANSMISSION-TIME'),
+      webhook_id: PAYPAL_WEBHOOK_ID,
+      webhook_event: req.body,
+    };
+
+    const verifyResp = await fetch(`${PAYPAL_API}/v1/notifications/verify-webhook-signature`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${access_token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(verifyPayload),
+    });
+
+    if (!verifyResp.ok) {
+      const t = await verifyResp.text();
+      console.error('[ERROR] PayPal verify call failed:', verifyResp.status, t);
+      return res.status(400).send('Verify failed');
+    }
+
+    const verifyJson = await verifyResp.json();
+    if (verifyJson.verification_status !== 'SUCCESS') {
+      console.error('[WARN] PayPal signature verification failed:', verifyJson);
+      return res.status(400).send('Bad signature');
+    }
+
+    // 3) Handle event
+    const event = req.body;
+    const eventType = event.event_type;
+
+    if (eventType === 'PAYMENT.CAPTURE.COMPLETED') {
+      const resource = event.resource || {};
+      const captureId = resource.id || null;
+
+      // PayPal email can be in different places depending on integration
+      const email =
+        resource.payer?.email_address ||
+        event.resource?.payer?.email_address ||
+        null;
+
+      // Dedupe by PayPal event id
+      const eventRef = firestore.collection('paypal_events').doc(event.id);
+
+      await firestore.runTransaction(async (tx) => {
+        const existing = await tx.get(eventRef);
+        if (existing.exists) return;
+
+        const licenseKey = makeLicenseKey();
+
+        const licenseDoc = {
+          licenseKey,
+          email,
+          paypal: {
+            eventId: event.id,
+            eventType,
+            captureId,
+            resourceType: event.resource_type || null,
+          },
+          status: 'active',
+          createdAt: nowIso(),
+          updatedAt: nowIso(),
+        };
+
+        tx.set(eventRef, {
+          processedAt: nowIso(),
+          eventType,
+          captureId,
+          email,
+          licenseKey,
+        });
+
+        tx.set(firestore.collection('licenses').doc(licenseKey), licenseDoc, { merge: true });
+      });
+
+      console.log('✅ PayPal PAYMENT.CAPTURE.COMPLETED processed', { eventId: event.id, captureId, email });
+    } else {
+      console.log('ℹ️ PayPal event received:', eventType);
+    }
+
+    return res.sendStatus(200);
+  } catch (err) {
+    console.error('🔥 PayPal webhook handler error:', err);
+    return res.status(500).send('Server error');
+  }
+});
+
+
 // -------------------- Start --------------------
 app.listen(PORT, () => {
   console.log(`bsp-licensing-webhook listening on ${PORT} (build ${BUILD_STAMP})`);
 });
+
 
 
 
