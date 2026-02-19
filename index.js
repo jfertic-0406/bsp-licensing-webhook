@@ -1,87 +1,130 @@
 'use strict';
 
 const express = require('express');
+const crypto = require('crypto');
 const Stripe = require('stripe');
-const admin = require('firebase-admin');
 
 const app = express();
 
-// ---- Required env vars (set in Cloud Run) ----
-// STRIPE_SECRET_KEY          = sk_test_...
-// STRIPE_WEBHOOK_SECRET      = whsec_...
-// (optional) FIRESTORE_COLLECTION = "licenses"
-const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
-const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+// -------------------- Config --------------------
+const PORT = process.env.PORT || 8080;
 
-const COLLECTION = process.env.FIRESTORE_COLLECTION || 'licenses';
+// Stripe
+const STRIPE_SECRET = process.env.STRIPE_SECRET; // sk_test_... or sk_live_...
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET; // whsec_...
 
-// Firestore Admin SDK uses Cloud Run’s service account automatically (no JSON key file)
-if (!admin.apps.length) {
-  admin.initializeApp();
+if (!STRIPE_SECRET) console.warn('Missing env var STRIPE_SECRET');
+if (!STRIPE_WEBHOOK_SECRET) console.warn('Missing env var STRIPE_WEBHOOK_SECRET');
+
+const stripe = Stripe(STRIPE_SECRET);
+
+// Firestore (uses Cloud Run service account via ADC)
+const { Firestore } = require('@google-cloud/firestore');
+const firestore = new Firestore();
+
+// -------------------- Helpers --------------------
+function makeLicenseKey() {
+  // human-friendly-ish key
+  // Example: BSP-9F3A7C2D-4B1E6A0C
+  const a = crypto.randomBytes(4).toString('hex').toUpperCase();
+  const b = crypto.randomBytes(4).toString('hex').toUpperCase();
+  return `BSP-${a}-${b}`;
 }
-const db = admin.firestore();
 
-// Stripe needs RAW body for signature verification on this route only
+function nowIso() {
+  return new Date().toISOString();
+}
+
+// -------------------- Routes --------------------
+app.get('/', (req, res) => {
+  res.type('text/plain').send('bsp-licensing-webhook ok');
+});
+
+app.get('/status', (req, res) => {
+  res.json({ ok: true, service: 'bsp-licensing-webhook', ts: nowIso() });
+});
+
+// IMPORTANT: Stripe webhook must use RAW body, not JSON parser
 app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
-  let event;
 
+  let event;
   try {
-    event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+    event = stripe.webhooks.constructEvent(
+      req.body,                 // raw Buffer
+      sig,
+      STRIPE_WEBHOOK_SECRET
+    );
   } catch (err) {
-    console.error('⚠️ Stripe signature verify failed:', err.message);
+    console.error('⚠️  Stripe signature verify failed:', err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
   try {
+    // We care about one-time purchase completion
     if (event.type === 'checkout.session.completed') {
       const session = event.data.object;
 
-      // Grab customer email (Stripe sometimes stores it in customer_details)
+      // Try to get an email
       const email =
         session.customer_details?.email ||
         session.customer_email ||
         null;
 
-      // What you store is up to you — this is a solid minimal license record
-      const docId = session.id; // stable + unique
-      await db.collection(COLLECTION).doc(docId).set(
-        {
-          sessionId: session.id,
-          email,
-          amount_total: session.amount_total || null,
-          currency: session.currency || null,
-          payment_status: session.payment_status || null,
-          mode: session.mode || null,
-          created: admin.firestore.FieldValue.serverTimestamp(),
-          livemode: !!event.livemode
-        },
-        { merge: true }
-      );
+      // If you used metadata in Checkout Link / session creation, it will be here:
+      const metadata = session.metadata || {};
 
-      console.log('✅ Stored license record for:', email, 'session:', session.id);
+      // Make a license document
+      const licenseKey = makeLicenseKey();
+
+      const doc = {
+        licenseKey,
+        email,
+        stripe: {
+          eventId: event.id,
+          sessionId: session.id,
+          paymentStatus: session.payment_status,
+          mode: session.mode,
+          amountTotal: session.amount_total,
+          currency: session.currency,
+          livemode: session.livemode,
+        },
+        metadata,
+        status: 'active',
+        createdAt: nowIso(),
+        updatedAt: nowIso(),
+      };
+
+      // Write to Firestore:
+      // Collection: licenses
+      // Document ID: licenseKey (easy lookups)
+      await firestore.collection('licenses').doc(licenseKey).set(doc, { merge: true });
+
+      console.log('✅ checkout.session.completed -> Firestore write OK', {
+        email,
+        licenseKey,
+        sessionId: session.id,
+      });
+    } else {
+      // Optional: log other events while you’re wiring things up
+      console.log('ℹ️ event received:', event.type);
     }
 
     return res.sendStatus(200);
   } catch (err) {
-    console.error('🔥 Webhook handler error:', err);
-    // Tell Stripe “we got it” ONLY if you want to avoid retries.
-    // For now, return 500 so you notice failures during testing.
-    return res.sendStatus(500);
+    console.error('🔥 webhook handler error:', err);
+    // Return 500 so Stripe retries (helps you catch issues during setup)
+    return res.status(500).send('Server error');
   }
 });
 
-// For non-webhook routes, use normal JSON parsing
-app.use(express.json());
+// For any accidental hits to unknown paths
+app.use((req, res) => res.status(404).json({ ok: false, error: 'Not found' }));
 
-app.get('/status', (req, res) => {
-  res.json({ ok: true, service: 'bsp-licensing-webhook' });
+// -------------------- Start --------------------
+app.listen(PORT, () => {
+  console.log(`bsp-licensing-webhook listening on ${PORT}`);
 });
 
-// Cloud Run port binding
-const port = process.env.PORT || 8080;
-app.listen(port, '0.0.0.0', () => {
-  console.log(`bsp-licensing-webhook listening on ${port}`);
-});
 
 
