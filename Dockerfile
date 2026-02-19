@@ -5,7 +5,7 @@ WORKDIR /app
 # Copy package manifest(s)
 COPY package*.json ./
 
-# If you *don't* have package-lock.json, use npm install (ci will fail)
+# Works without package-lock.json
 RUN npm install --omit=dev
 
 # Copy app source
