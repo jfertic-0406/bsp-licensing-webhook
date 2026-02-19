@@ -11,7 +11,7 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 
 // Change this every commit so /status proves you’re on the latest revision
-const BUILD_STAMP = '2026-02-19-01';
+const BUILD_STAMP = '2026-02-19-02';
 
 // Stripe env vars
 const STRIPE_SECRET = process.env.STRIPE_SECRET;                 // sk_test_... or sk_live_...
@@ -37,7 +37,65 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+// Minimal email hashing so you can correlate without exposing email
+function sha256Hex(s) {
+  return crypto.createHash('sha256').update(String(s || ''), 'utf8').digest('hex');
+}
+
+function normalizeLicenseKey(k) {
+  return String(k || '').trim().toUpperCase();
+}
+
+// Accept only keys like BSP-XXXXXXXX-XXXXXXXX (hex blocks)
+function isValidLicenseKey(k) {
+  return /^BSP-[0-9A-F]{8}-[0-9A-F]{8}$/.test(k);
+}
+
+// Read license doc, return safe payload
+async function lookupLicense(licenseKey) {
+  const key = normalizeLicenseKey(licenseKey);
+  if (!isValidLicenseKey(key)) {
+    return { ok: false, error: 'Invalid license key format' };
+  }
+
+  const snap = await firestore.collection('licenses').doc(key).get();
+  if (!snap.exists) {
+    return { ok: false, error: 'License not found' };
+  }
+
+  const doc = snap.data() || {};
+  const status = doc.status || 'unknown';
+  const createdAt = doc.createdAt || null;
+  const updatedAt = doc.updatedAt || null;
+
+  // Never return raw email from the API
+  const emailHash = doc.email ? sha256Hex(doc.email) : null;
+
+  // Optional: allow future expiration field
+  const expiresAt = doc.expiresAt || null;
+
+  return {
+    ok: true,
+    licenseKey: key,
+    status,
+    createdAt,
+    updatedAt,
+    expiresAt,
+    emailHash,
+  };
+}
+
 // -------------------- Routes --------------------
+
+// (Optional) Small CORS helper so you can test from browsers later without pain
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Stripe-Signature');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 app.get('/', (req, res) => {
   res.type('text/plain').send('bsp-licensing-webhook ok');
 });
@@ -49,6 +107,29 @@ app.get('/status', (req, res) => {
     build: BUILD_STAMP,
     ts: nowIso(),
   });
+});
+
+// ✅ License lookup by URL (what the plugin can call)
+app.get('/license/:key', async (req, res) => {
+  try {
+    const out = await lookupLicense(req.params.key);
+    return res.status(out.ok ? 200 : 404).json(out);
+  } catch (err) {
+    console.error('🔥 /license/:key error:', err);
+    return res.status(500).json({ ok: false, error: 'Server error' });
+  }
+});
+
+// ✅ License verify by JSON body (also plugin-friendly)
+app.post('/license/verify', express.json(), async (req, res) => {
+  try {
+    const licenseKey = req.body && req.body.licenseKey;
+    const out = await lookupLicense(licenseKey);
+    return res.status(out.ok ? 200 : 404).json(out);
+  } catch (err) {
+    console.error('🔥 /license/verify error:', err);
+    return res.status(500).json({ ok: false, error: 'Server error' });
+  }
 });
 
 // IMPORTANT:
@@ -146,9 +227,6 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
   }
 });
 
-// Helpful: JSON parser for non-webhook routes (AFTER webhook route)
-app.use(express.json());
-
 // For any accidental hits to unknown paths
 app.use((req, res) => res.status(404).json({ ok: false, error: 'Not found' }));
 
@@ -156,6 +234,8 @@ app.use((req, res) => res.status(404).json({ ok: false, error: 'Not found' }));
 app.listen(PORT, () => {
   console.log(`bsp-licensing-webhook listening on ${PORT} (build ${BUILD_STAMP})`);
 });
+
+
 
 
 
