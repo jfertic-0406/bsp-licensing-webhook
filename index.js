@@ -10,8 +10,11 @@ const app = express();
 // -------------------- Config --------------------
 const PORT = process.env.PORT || 8080;
 
+// Change this every commit so /status proves you’re on the latest revision
+const BUILD_STAMP = '2026-02-19-01';
+
 // Stripe env vars
-const STRIPE_SECRET = process.env.STRIPE_SECRET;               // sk_test_... or sk_live_...
+const STRIPE_SECRET = process.env.STRIPE_SECRET;                 // sk_test_... or sk_live_...
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET; // whsec_...
 
 if (!STRIPE_SECRET) console.warn('[WARN] Missing env var STRIPE_SECRET');
@@ -39,8 +42,13 @@ app.get('/', (req, res) => {
   res.type('text/plain').send('bsp-licensing-webhook ok');
 });
 
-app.get('/status', async (req, res) => {
-  res.json({ ok: true, service: 'bsp-licensing-webhook', ts: nowIso() });
+app.get('/status', (req, res) => {
+  res.json({
+    ok: true,
+    service: 'bsp-licensing-webhook',
+    build: BUILD_STAMP,
+    ts: nowIso(),
+  });
 });
 
 // IMPORTANT:
@@ -83,17 +91,12 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
       const metadata = session.metadata || {};
 
       // ---- Idempotency / De-dupe ----
-      // Use Stripe event id as the primary dedupe key
-      // so resends don't generate more licenses.
+      // Stripe can resend the same event. We store event.id so we never double-issue.
       const eventRef = firestore.collection('stripe_events').doc(event.id);
 
-      // Also store license in licenses collection; licenseKey is human friendly.
       await firestore.runTransaction(async (tx) => {
         const existing = await tx.get(eventRef);
-        if (existing.exists) {
-          // Already processed this event
-          return;
-        }
+        if (existing.exists) return;
 
         const licenseKey = makeLicenseKey();
 
@@ -107,7 +110,7 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
             mode: session.mode,
             amountTotal: session.amount_total,
             currency: session.currency,
-            livemode: session.livemode,
+            livemode: !!session.livemode,
           },
           metadata,
           status: 'active',
@@ -115,7 +118,6 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
           updatedAt: nowIso(),
         };
 
-        // Record event processed
         tx.set(eventRef, {
           processedAt: nowIso(),
           type: event.type,
@@ -124,9 +126,7 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
           licenseKey,
         });
 
-        // Write license
-        const licenseRef = firestore.collection('licenses').doc(licenseKey);
-        tx.set(licenseRef, licenseDoc, { merge: true });
+        tx.set(firestore.collection('licenses').doc(licenseKey), licenseDoc, { merge: true });
       });
 
       console.log('✅ checkout.session.completed processed', {
@@ -135,7 +135,6 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
         email,
       });
     } else {
-      // Optional during setup
       console.log('ℹ️ event received:', event.type);
     }
 
@@ -155,8 +154,10 @@ app.use((req, res) => res.status(404).json({ ok: false, error: 'Not found' }));
 
 // -------------------- Start --------------------
 app.listen(PORT, () => {
-  console.log(`bsp-licensing-webhook listening on ${PORT}`);
+  console.log(`bsp-licensing-webhook listening on ${PORT} (build ${BUILD_STAMP})`);
 });
+
+
 
 
 
