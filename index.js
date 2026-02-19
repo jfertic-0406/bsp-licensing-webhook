@@ -19,8 +19,14 @@ if (!STRIPE_WEBHOOK_SECRET) console.warn('Missing env var STRIPE_WEBHOOK_SECRET'
 const stripe = Stripe(STRIPE_SECRET);
 
 // Firestore (uses Cloud Run service account via ADC)
-const { Firestore } = require('@google-cloud/firestore');
-const firestore = new Firestore();
+const admin = require('firebase-admin');
+
+if (!admin.apps.length) {
+  admin.initializeApp(); // Cloud Run will use the service account automatically
+}
+
+const firestore = admin.firestore();
+
 
 // -------------------- Helpers --------------------
 function makeLicenseKey() {
@@ -125,6 +131,7 @@ app.use((req, res) => res.status(404).json({ ok: false, error: 'Not found' }));
 app.listen(PORT, () => {
   console.log(`bsp-licensing-webhook listening on ${PORT}`);
 });
+
 
 
 
