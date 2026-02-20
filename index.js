@@ -10,8 +10,8 @@ const app = express();
 // -------------------- Config --------------------
 const PORT = process.env.PORT || 8080;
 
-// bump this each commit if you want
-const BUILD_STAMP = '2026-02-19-02';
+// Change this every commit so /status proves you’re on the latest revision
+const BUILD_STAMP = '2026-02-20-01';
 
 // Stripe env vars
 const STRIPE_SECRET = process.env.STRIPE_SECRET;                   // sk_test_... or sk_live_...
@@ -20,10 +20,29 @@ const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;   // whsec_...
 if (!STRIPE_SECRET) console.warn('[WARN] Missing env var STRIPE_SECRET');
 if (!STRIPE_WEBHOOK_SECRET) console.warn('[WARN] Missing env var STRIPE_WEBHOOK_SECRET');
 
+// Only create Stripe client if secret exists (prevents crashes during deploy)
 const stripe = STRIPE_SECRET ? Stripe(STRIPE_SECRET) : null;
 
-// Firestore (Cloud Run uses service account automatically via ADC)
+// Firestore (Cloud Run uses Service Account automatically via ADC)
 const firestore = new Firestore();
+
+// PayPal env vars
+const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID || '';
+const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET || '';
+const PAYPAL_WEBHOOK_ID = process.env.PAYPAL_WEBHOOK_ID || ''; // from PayPal app webhook details
+const PAYPAL_MODE = (process.env.PAYPAL_MODE || 'sandbox').toLowerCase(); // sandbox | live
+
+const PAYPAL_BASE =
+  PAYPAL_MODE === 'live'
+    ? 'https://api-m.paypal.com'
+    : 'https://api-m.sandbox.paypal.com';
+
+// In sandbox, PayPal simulator payloads can be “mocky” — allow unverified in sandbox if you want
+const PAYPAL_ALLOW_UNVERIFIED = (process.env.PAYPAL_ALLOW_UNVERIFIED || (PAYPAL_MODE === 'sandbox' ? 'true' : 'false')).toLowerCase() === 'true';
+
+if (!PAYPAL_CLIENT_ID) console.warn('[WARN] Missing env var PAYPAL_CLIENT_ID');
+if (!PAYPAL_CLIENT_SECRET) console.warn('[WARN] Missing env var PAYPAL_CLIENT_SECRET');
+if (!PAYPAL_WEBHOOK_ID) console.warn('[WARN] Missing env var PAYPAL_WEBHOOK_ID');
 
 // -------------------- Helpers --------------------
 function makeLicenseKey() {
@@ -34,6 +53,75 @@ function makeLicenseKey() {
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+async function paypalGetAccessToken() {
+  const creds = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString('base64');
+
+  const res = await fetch(`${PAYPAL_BASE}/v1/oauth2/token`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Basic ${creds}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: 'grant_type=client_credentials',
+  });
+
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    throw new Error(`PayPal token error ${res.status}: ${txt}`);
+  }
+
+  const json = await res.json();
+  return json.access_token;
+}
+
+async function paypalVerifyWebhookSignature(reqHeaders, rawEventBody) {
+  // PayPal sends these headers (names are case-insensitive; Node lowercases them)
+  const transmissionId = reqHeaders['paypal-transmission-id'];
+  const transmissionTime = reqHeaders['paypal-transmission-time'];
+  const transmissionSig = reqHeaders['paypal-transmission-sig'];
+  const certUrl = reqHeaders['paypal-cert-url'];
+  const authAlgo = reqHeaders['paypal-auth-algo'];
+
+  // If any are missing, verification can’t happen (common in some simulators)
+  if (!transmissionId || !transmissionTime || !transmissionSig || !certUrl || !authAlgo) {
+    return { verified: false, reason: 'missing_paypal_headers' };
+  }
+
+  if (!PAYPAL_WEBHOOK_ID || !PAYPAL_CLIENT_ID || !PAYPAL_CLIENT_SECRET) {
+    return { verified: false, reason: 'missing_paypal_env' };
+  }
+
+  const accessToken = await paypalGetAccessToken();
+
+  const payload = {
+    auth_algo: authAlgo,
+    cert_url: certUrl,
+    transmission_id: transmissionId,
+    transmission_sig: transmissionSig,
+    transmission_time: transmissionTime,
+    webhook_id: PAYPAL_WEBHOOK_ID,
+    webhook_event: rawEventBody, // object, not string
+  };
+
+  const res = await fetch(`${PAYPAL_BASE}/v1/notifications/verify-webhook-signature`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    return { verified: false, reason: `verify_api_error_${res.status}`, detail: txt };
+  }
+
+  const json = await res.json();
+  // json.verification_status === "SUCCESS"
+  return { verified: json.verification_status === 'SUCCESS', detail: json };
 }
 
 // -------------------- Routes --------------------
@@ -47,13 +135,14 @@ app.get('/status', (req, res) => {
     service: 'bsp-licensing-webhook',
     build: BUILD_STAMP,
     ts: nowIso(),
+    paypalMode: PAYPAL_MODE,
   });
 });
 
-// -------------------- STRIPE WEBHOOK --------------------
+// ==================== STRIPE WEBHOOK ====================
 // IMPORTANT:
-// Stripe requires RAW body for signature verification.
-// Do NOT use express.json() on this route.
+// - Stripe requires the RAW body for signature verification.
+// - Do NOT use express.json() on this route.
 app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
   try {
     if (!stripe) {
@@ -66,7 +155,10 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
     }
 
     const sig = req.headers['stripe-signature'];
-    if (!sig) return res.status(400).send('Missing stripe-signature');
+    if (!sig) {
+      console.error('[ERROR] Missing stripe-signature header.');
+      return res.status(400).send('Missing stripe-signature');
+    }
 
     let event;
     try {
@@ -86,7 +178,7 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
 
       const metadata = session.metadata || {};
 
-      // idempotency by Stripe event.id
+      // Dedupe by Stripe event id
       const eventRef = firestore.collection('stripe_events').doc(event.id);
 
       await firestore.runTransaction(async (tx) => {
@@ -98,8 +190,9 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
         const licenseDoc = {
           licenseKey,
           email,
-          provider: 'stripe',
+          emailHash: email ? crypto.createHash('sha256').update(email.toLowerCase().trim()).digest('hex') : null,
           stripe: {
+            provider: 'stripe',
             eventId: event.id,
             sessionId: session.id,
             paymentStatus: session.payment_status,
@@ -142,105 +235,154 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
   }
 });
 
-// -------------------- PAYPAL WEBHOOK --------------------
-// PayPal sends JSON. Simulator events do NOT include everything needed for full verification.
-// For now: accept JSON and mint license based on event.id (WH-...).
-app.post('/webhook/paypal', express.json({ type: '*/*' }), async (req, res) => {
+// ==================== PAYPAL WEBHOOK ====================
+// PayPal does NOT require raw body for verification like Stripe does.
+// We parse JSON here.
+app.post('/webhook/paypal', express.json({ type: 'application/json' }), async (req, res) => {
   try {
-    const body = req.body || {};
-    const eventType = body.event_type || null;
-    const eventId = body.id || null;
+    const event = req.body || {};
+    const eventId = event.id || null;
+    const eventType = event.event_type || null;
+    const resourceType = event.resource_type || null;
+    const createTime = event.create_time || null;
+    const resource = event.resource || {};
 
     if (!eventId || !eventType) {
-      return res.status(400).json({ ok: false, error: 'Missing PayPal event id/type' });
+      console.error('[ERROR] PayPal webhook missing id/event_type');
+      return res.status(400).json({ ok: false, error: 'invalid_paypal_payload' });
     }
 
-    // These are "paid" events (mint license)
-    const PAID_EVENTS = new Set([
-      'PAYMENT.CAPTURE.COMPLETED',
-      'PAYMENT.SALE.COMPLETED',
-    ]);
+    // Verify signature if we can (recommended for live)
+    let verified = false;
+    let verifyInfo = null;
 
-    const resource = body.resource || {};
+    const canVerify =
+      PAYPAL_WEBHOOK_ID &&
+      PAYPAL_CLIENT_ID &&
+      PAYPAL_CLIENT_SECRET &&
+      req.headers['paypal-transmission-id'];
 
-    // CAPTURE: amount.value + currency_code
-    // SALE: amount.total + currency
-    const amountStr =
-      resource.amount?.value ??
-      resource.amount?.total ??
+    if (canVerify) {
+      const v = await paypalVerifyWebhookSignature(req.headers, event);
+      verified = !!v.verified;
+      verifyInfo = v;
+      if (!verified && !PAYPAL_ALLOW_UNVERIFIED) {
+        console.error('⚠️ PayPal signature verify failed', v);
+        return res.status(400).json({ ok: false, error: 'paypal_signature_verify_failed', detail: v.reason || null });
+      }
+    } else {
+      if (!PAYPAL_ALLOW_UNVERIFIED) {
+        console.error('⚠️ PayPal verification unavailable and PAYPAL_ALLOW_UNVERIFIED=false');
+        return res.status(400).json({ ok: false, error: 'paypal_verification_unavailable' });
+      }
+    }
+
+    // Only mint licenses for payment completion type events you choose to trust.
+    // Common options:
+    // - PAYMENT.CAPTURE.COMPLETED (checkout capture)
+    // - PAYMENT.SALE.COMPLETED (older REST “sale”)
+    const shouldMint =
+      eventType === 'PAYMENT.CAPTURE.COMPLETED' ||
+      eventType === 'PAYMENT.SALE.COMPLETED';
+
+    // Pull amount/currency in a tolerant way
+    let amount = null;
+    let currency = null;
+
+    if (resource?.amount?.value && resource?.amount?.currency_code) {
+      amount = Number(resource.amount.value);
+      currency = resource.amount.currency_code;
+    } else if (resource?.amount?.total && resource?.amount?.currency) {
+      amount = Number(resource.amount.total);
+      currency = resource.amount.currency;
+    }
+
+    // IDs
+    const captureId = resource?.id || null;
+    const orderId =
+      resource?.supplementary_data?.related_ids?.order_id ||
+      resource?.parent_payment ||
       null;
 
-    const currency =
-      resource.amount?.currency_code ??
-      resource.amount?.currency ??
-      null;
+    // PayPal often does NOT include an email in webhooks.
+    const email = resource?.payer?.email_address || null;
 
-    const amount = amountStr != null ? Number(amountStr) : null;
-
-    // Store every PayPal event for audit/debug
+    // Dedupe by PayPal event id
     const eventRef = firestore.collection('paypal_events').doc(eventId);
 
-    if (!PAID_EVENTS.has(eventType)) {
-      await eventRef.set({ receivedAt: nowIso(), eventType, raw: body }, { merge: true });
-      return res.status(200).json({ ok: true, ignored: true, eventType });
-    }
-
-    // Idempotency: one license per PayPal event id
     await firestore.runTransaction(async (tx) => {
       const existing = await tx.get(eventRef);
       if (existing.exists) return;
 
-      const licenseKey = makeLicenseKey();
+      let licenseKey = null;
 
-      const licenseDoc = {
-        licenseKey,
-        email: null,          // PayPal webhooks often don't include buyer email (especially simulator)
-        provider: 'paypal',
-        paypal: {
-          eventId,
-          eventType,
-          resourceType: body.resource_type || null,
-          summary: body.summary || null,
-          amount,
-          currency,
-          captureId: resource.id || null,
-          createTime: resource.create_time || body.create_time || null,
-        },
-        status: 'active',
-        createdAt: nowIso(),
-        updatedAt: nowIso(),
-        expiresAt: null,
-      };
+      if (shouldMint) {
+        licenseKey = makeLicenseKey();
+
+        const licenseDoc = {
+          licenseKey,
+          email,
+          emailHash: email ? crypto.createHash('sha256').update(email.toLowerCase().trim()).digest('hex') : null,
+          paypal: {
+            provider: 'paypal',
+            eventId,
+            eventType,
+            resourceType,
+            createTime,
+            captureId,
+            orderId,
+            amount,
+            currency,
+            verified: !!verified,
+          },
+          metadata: {},
+          status: 'active',
+          createdAt: nowIso(),
+          updatedAt: nowIso(),
+          expiresAt: null,
+        };
+
+        tx.set(firestore.collection('licenses').doc(licenseKey), licenseDoc, { merge: true });
+      }
 
       tx.set(eventRef, {
         processedAt: nowIso(),
+        verified: !!verified,
+        eventId,
         eventType,
+        resourceType,
+        createTime,
+        captureId,
+        orderId,
         amount,
         currency,
-        licenseKey,
+        email,
+        licenseKey: licenseKey || null,
       });
-
-      tx.set(firestore.collection('licenses').doc(licenseKey), licenseDoc, { merge: true });
     });
 
-    console.log('✅ PayPal paid event processed', { eventId, eventType, amount, currency });
+    console.log('✅ PayPal event processed', {
+      eventId,
+      eventType,
+      verified,
+      minted: shouldMint,
+    });
+
     return res.status(200).json({ ok: true });
   } catch (err) {
     console.error('🔥 PayPal webhook handler error:', err);
-    return res.status(500).json({ ok: false, error: 'Server error' });
+    return res.status(500).json({ ok: false, error: 'server_error' });
   }
 });
 
-// Helpful: JSON parser for any future non-webhook JSON endpoints (placed AFTER Stripe raw route)
-app.use(express.json());
-
-// Catch-all 404 LAST
+// For any accidental hits to unknown paths
 app.use((req, res) => res.status(404).json({ ok: false, error: 'Not found' }));
 
 // -------------------- Start --------------------
 app.listen(PORT, () => {
   console.log(`bsp-licensing-webhook listening on ${PORT} (build ${BUILD_STAMP})`);
 });
+
 
 
 
