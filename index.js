@@ -6,6 +6,7 @@ const Stripe = require('stripe');
 const { Firestore } = require('@google-cloud/firestore');
 
 const app = express();
+app.use(express.json({ limit: '256kb' }));
 
 // -------------------- Config --------------------
 const PORT = process.env.PORT || 8080;
@@ -137,6 +138,55 @@ app.get('/status', (req, res) => {
     ts: nowIso(),
     paypalMode: PAYPAL_MODE,
   });
+});
+
+app.post('/verify', async (req, res) => {
+  try {
+    const key = String(req.body?.key || '').trim();
+    const machineId = String(req.body?.machineId || '').trim();
+
+    if (!key || !machineId) {
+      return res.status(400).json({ status: 'invalid', message: 'Missing key or machineId.' });
+    }
+
+    const ref = firestore.collection('licenses').doc(key);
+    const snap = await ref.get();
+
+    if (!snap.exists) {
+      return res.json({ status: 'invalid', message: 'Key not found.' });
+    }
+
+    const lic = snap.data() || {};
+    if ((lic.status || 'active') !== 'active') {
+      return res.json({ status: 'invalid', message: 'License is disabled.' });
+    }
+
+    const maxDevices = Number(lic.maxDevices || 2);
+    const devices = Array.isArray(lic.devices) ? lic.devices : [];
+
+    const now = nowIso();
+
+    // already activated on this machine?
+    const idx = devices.findIndex(d => d && d.id === machineId);
+    if (idx >= 0) {
+      devices[idx].lastSeen = now;
+      await ref.set({ devices, updatedAt: now }, { merge: true });
+      return res.json({ status: 'valid', message: 'License verified.' });
+    }
+
+    // new machine
+    if (devices.length >= maxDevices) {
+      return res.json({ status: 'max_devices', message: `Device limit reached (${maxDevices}).` });
+    }
+
+    devices.push({ id: machineId, firstSeen: now, lastSeen: now });
+    await ref.set({ devices, maxDevices, updatedAt: now }, { merge: true });
+
+    return res.json({ status: 'valid', message: 'License verified.' });
+  } catch (err) {
+    console.error('🔥 verify error:', err);
+    return res.status(500).json({ status: 'error', message: 'Server error.' });
+  }
 });
 
 // ==================== STRIPE WEBHOOK ====================
@@ -382,6 +432,7 @@ app.use((req, res) => res.status(404).json({ ok: false, error: 'Not found' }));
 app.listen(PORT, () => {
   console.log(`bsp-licensing-webhook listening on ${PORT} (build ${BUILD_STAMP})`);
 });
+
 
 
 
