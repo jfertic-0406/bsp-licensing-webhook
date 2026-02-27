@@ -372,6 +372,46 @@ app.post('/paypal/capture-order', async (req, res) => {
   }
 });
 
+app.post('/stripe/create-checkout-session', async (req, res) => {
+  try {
+    const origin = req.headers.origin;
+    // If you have the corsAllow helper in your updated file, call it here:
+    // corsAllow(res, origin);
+
+    if (!stripe) return res.status(500).json({ ok: false, error: 'stripe_not_configured' });
+
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    if (!email) return res.status(400).json({ ok: false, error: 'missing_email' });
+
+    const priceId = process.env.STRIPE_PRICE_ID;
+    if (!priceId) return res.status(500).json({ ok: false, error: 'missing_STRIPE_PRICE_ID' });
+
+    const siteUrl = process.env.SITE_URL || 'https://betterhomephotos.net';
+    const successUrl = `${siteUrl}/bsp-thank-you/?provider=stripe&session_id={CHECKOUT_SESSION_ID}`;
+    const cancelUrl  = `${siteUrl}/lightroom-classic-branding-plugin/?cancelled=1`;
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      customer_email: email,
+      line_items: [{ price: priceId, quantity: 1 }],
+      success_url: successUrl,
+      cancel_url: cancelUrl,
+      metadata: {
+        license_email: email,
+        license_seats: '2',
+        license_tier: 'standard',
+        product: 'BrandStampPro',
+        version_entitlement: '1.x', // change only if you truly intend 2.x
+      },
+    });
+
+    return res.json({ ok: true, url: session.url });
+  } catch (err) {
+    console.error('🔥 /stripe/create-checkout-session error:', err);
+    return res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
 // ==================== STRIPE WEBHOOK ====================
 // Stripe requires the RAW body for signature verification.
 app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
