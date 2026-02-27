@@ -12,7 +12,7 @@ app.use(express.json({ limit: '256kb' }));
 const PORT = process.env.PORT || 8080;
 
 // Change this every commit so /status proves you’re on the latest revision
-const BUILD_STAMP = '2026-02-20-01';
+const BUILD_STAMP = '2026-02-27-01';
 
 // Stripe env vars
 const STRIPE_SECRET = process.env.STRIPE_SECRET;                   // sk_test_... or sk_live_...
@@ -45,6 +45,12 @@ if (!PAYPAL_CLIENT_ID) console.warn('[WARN] Missing env var PAYPAL_CLIENT_ID');
 if (!PAYPAL_CLIENT_SECRET) console.warn('[WARN] Missing env var PAYPAL_CLIENT_SECRET');
 if (!PAYPAL_WEBHOOK_ID) console.warn('[WARN] Missing env var PAYPAL_WEBHOOK_ID');
 
+// BSP product defaults (optional, but keeps things consistent)
+const BSP_PRODUCT = process.env.BSP_PRODUCT || 'BrandStampPro';
+const BSP_DEFAULT_SEATS = Number(process.env.BSP_DEFAULT_SEATS || 2);
+const BSP_DEFAULT_TIER = process.env.BSP_DEFAULT_TIER || 'standard';
+const BSP_DEFAULT_ENTITLEMENT = process.env.BSP_DEFAULT_ENTITLEMENT || '1.x'; // change if you truly intend 2.x
+
 // -------------------- Helpers --------------------
 function makeLicenseKey() {
   const a = crypto.randomBytes(4).toString('hex').toUpperCase();
@@ -54,6 +60,17 @@ function makeLicenseKey() {
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function normalizeEmail(v) {
+  const s = String(v || '').trim().toLowerCase();
+  return s || null;
+}
+
+function makePurchaseRef() {
+  // short, unique, readable
+  const tail = crypto.randomBytes(3).toString('hex').toUpperCase();
+  return `BSP-${Date.now()}-${tail}`;
 }
 
 async function paypalGetAccessToken() {
@@ -137,9 +154,15 @@ app.get('/status', (req, res) => {
     build: BUILD_STAMP,
     ts: nowIso(),
     paypalMode: PAYPAL_MODE,
+    allowUnverifiedPaypal: PAYPAL_ALLOW_UNVERIFIED,
   });
 });
 
+/**
+ * License verification endpoint (BSP Activate / Verify)
+ * Expects: { key, machineId }
+ * Returns: { status: valid|invalid|max_devices|error, message }
+ */
 app.post('/verify', async (req, res) => {
   try {
     const key = String(req.body?.key || '').trim();
@@ -186,6 +209,86 @@ app.post('/verify', async (req, res) => {
   } catch (err) {
     console.error('🔥 verify error:', err);
     return res.status(500).json({ status: 'error', message: 'Server error.' });
+  }
+});
+
+/**
+ * PayPal Create Order (server-side)
+ * Purpose: create a pending record with email + purchaseRef, then create PayPal order
+ * Expects: { email, amount? }  (amount optional; you can hardcode/compute server-side)
+ * Returns: { ok, orderId, purchaseRef }
+ */
+app.post('/paypal/create-order', async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body?.email);
+    const amountValue = String(req.body?.amount || '30.00'); // TODO: compute from SKU/pricing if needed
+    const currency = 'USD';
+
+    if (!email) return res.status(400).json({ ok: false, error: 'missing_email' });
+
+    const purchaseRef = makePurchaseRef();
+
+    // Write pending purchase first (this is the critical bridge that fixes email:null in webhook)
+    await firestore.collection('paypal_purchases').doc(purchaseRef).set({
+      purchaseRef,
+      email,
+      product: BSP_PRODUCT,
+      license_seats: BSP_DEFAULT_SEATS,
+      license_tier: BSP_DEFAULT_TIER,
+      version_entitlement: BSP_DEFAULT_ENTITLEMENT,
+      status: 'pending',
+      amount: Number(amountValue),
+      currency,
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+      paypalMode: PAYPAL_MODE,
+    });
+
+    const accessToken = await paypalGetAccessToken();
+
+    const orderPayload = {
+      intent: 'CAPTURE',
+      purchase_units: [{
+        amount: { currency_code: currency, value: amountValue },
+        invoice_id: purchaseRef, // <-- BRIDGE (comes back on capture webhook)
+        custom_id: purchaseRef,  // <-- redundant but useful
+      }],
+    };
+
+    const resp = await fetch(`${PAYPAL_BASE}/v2/checkout/orders`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(orderPayload),
+    });
+
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => '');
+      console.error('🔥 PayPal create order failed:', resp.status, txt);
+      // Mark pending as failed
+      await firestore.collection('paypal_purchases').doc(purchaseRef).set({
+        status: 'failed',
+        error: `paypal_create_order_failed_${resp.status}`,
+        updatedAt: nowIso(),
+      }, { merge: true });
+
+      return res.status(500).json({ ok: false, error: 'paypal_create_order_failed', detail: txt });
+    }
+
+    const order = await resp.json();
+
+    // Store orderId on pending record
+    await firestore.collection('paypal_purchases').doc(purchaseRef).set({
+      orderId: order?.id || null,
+      updatedAt: nowIso(),
+    }, { merge: true });
+
+    return res.json({ ok: true, orderId: order.id, purchaseRef });
+  } catch (err) {
+    console.error('🔥 /paypal/create-order error:', err);
+    return res.status(500).json({ ok: false, error: 'server_error' });
   }
 });
 
@@ -327,13 +430,8 @@ app.post('/webhook/paypal', express.json({ type: 'application/json' }), async (r
       }
     }
 
-    // Only mint licenses for payment completion type events you choose to trust.
-    // Common options:
-    // - PAYMENT.CAPTURE.COMPLETED (checkout capture)
-    // - PAYMENT.SALE.COMPLETED (older REST “sale”)
-    const shouldMint =
-      eventType === 'PAYMENT.CAPTURE.COMPLETED' ||
-      eventType === 'PAYMENT.SALE.COMPLETED';
+    // Trust only V2 capture completion (your payload is resource_version 2.0)
+    const shouldMint = eventType === 'PAYMENT.CAPTURE.COMPLETED';
 
     // Pull amount/currency in a tolerant way
     let amount = null;
@@ -354,10 +452,36 @@ app.post('/webhook/paypal', express.json({ type: 'application/json' }), async (r
       resource?.parent_payment ||
       null;
 
-    // PayPal often does NOT include an email in webhooks.
-    const email = resource?.payer?.email_address || null;
+    // Bridge key (must be set during create-order as invoice_id/custom_id)
+    const purchaseRef =
+      resource?.invoice_id ||
+      resource?.custom_id ||
+      null;
 
-    // Dedupe by PayPal event id
+    // CAPTURE DEDUPE: PayPal may resend the same capture with a new eventId.
+    if (captureId) {
+      const capRef = firestore.collection('paypal_captures').doc(captureId);
+      const capSnap = await capRef.get();
+      if (capSnap.exists) {
+        console.log('ℹ️ PayPal capture deduped', { captureId, eventId, eventType });
+        return res.status(200).json({ ok: true, deduped: true });
+      }
+    }
+
+    // Hydrate email from our pending purchase doc (reliable)
+    let email = null;
+
+    if (purchaseRef) {
+      const pSnap = await firestore.collection('paypal_purchases').doc(purchaseRef).get();
+      if (pSnap.exists) {
+        email = pSnap.data()?.email || null;
+      }
+    }
+
+    // Fallback (often absent)
+    email = email || resource?.payer?.email_address || null;
+
+    // Dedupe by PayPal event id too (still useful)
     const eventRef = firestore.collection('paypal_events').doc(eventId);
 
     await firestore.runTransaction(async (tx) => {
@@ -381,6 +505,7 @@ app.post('/webhook/paypal', express.json({ type: 'application/json' }), async (r
             createTime,
             captureId,
             orderId,
+            purchaseRef,
             amount,
             currency,
             verified: !!verified,
@@ -393,17 +518,40 @@ app.post('/webhook/paypal', express.json({ type: 'application/json' }), async (r
         };
 
         tx.set(firestore.collection('licenses').doc(licenseKey), licenseDoc, { merge: true });
+
+        // Mark pending purchase as paid (optional but recommended)
+        if (purchaseRef) {
+          tx.set(firestore.collection('paypal_purchases').doc(purchaseRef), {
+            status: 'paid',
+            captureId,
+            orderId,
+            updatedAt: nowIso(),
+          }, { merge: true });
+        }
+
+        // Capture dedupe marker
+        if (captureId) {
+          tx.set(firestore.collection('paypal_captures').doc(captureId), {
+            captureId,
+            eventId,
+            eventType,
+            purchaseRef: purchaseRef || null,
+            processedAt: nowIso(),
+          }, { merge: true });
+        }
       }
 
       tx.set(eventRef, {
         processedAt: nowIso(),
         verified: !!verified,
+        verifyInfo: verifyInfo ? (verifyInfo.reason || verifyInfo.detail || null) : null,
         eventId,
         eventType,
         resourceType,
         createTime,
         captureId,
         orderId,
+        purchaseRef: purchaseRef || null,
         amount,
         currency,
         email,
@@ -416,6 +564,9 @@ app.post('/webhook/paypal', express.json({ type: 'application/json' }), async (r
       eventType,
       verified,
       minted: shouldMint,
+      captureId,
+      purchaseRef,
+      hasEmail: !!email,
     });
 
     return res.status(200).json({ ok: true });
