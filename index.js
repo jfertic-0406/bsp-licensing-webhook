@@ -372,6 +372,10 @@ app.post('/paypal/capture-order', async (req, res) => {
   }
 });
 
+res.setHeader('Access-Control-Allow-Origin', 'https://betterhomephotos.net');
+res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
+res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
 app.post('/stripe/create-checkout-session', async (req, res) => {
   try {
     const origin = req.headers.origin;
@@ -691,8 +695,16 @@ app.post('/webhook/paypal', async (req, res) => {
   }
 });
 
+app.options('/stripe/create-checkout-session', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', 'https://betterhomephotos.net');
+  res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.sendStatus(204);
+});
+
 // For any accidental hits to unknown paths
 app.use((req, res) => res.status(404).json({ ok: false, error: 'Not found' }));
+
 
 // -------------------- Start --------------------
 app.listen(PORT, () => {
