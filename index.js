@@ -6,13 +6,12 @@ const Stripe = require('stripe');
 const { Firestore } = require('@google-cloud/firestore');
 
 const app = express();
-app.use(express.json({ limit: '256kb' }));
 
 // -------------------- Config --------------------
 const PORT = process.env.PORT || 8080;
 
 // Change this every commit so /status proves you’re on the latest revision
-const BUILD_STAMP = '2026-02-27-01';
+const BUILD_STAMP = '2026-02-27-02';
 
 // Stripe env vars
 const STRIPE_SECRET = process.env.STRIPE_SECRET;                   // sk_test_... or sk_live_...
@@ -39,7 +38,8 @@ const PAYPAL_BASE =
     : 'https://api-m.sandbox.paypal.com';
 
 // In sandbox, PayPal simulator payloads can be “mocky” — allow unverified in sandbox if you want
-const PAYPAL_ALLOW_UNVERIFIED = (process.env.PAYPAL_ALLOW_UNVERIFIED || (PAYPAL_MODE === 'sandbox' ? 'true' : 'false')).toLowerCase() === 'true';
+const PAYPAL_ALLOW_UNVERIFIED = (process.env.PAYPAL_ALLOW_UNVERIFIED || (PAYPAL_MODE === 'sandbox' ? 'true' : 'false'))
+  .toLowerCase() === 'true';
 
 if (!PAYPAL_CLIENT_ID) console.warn('[WARN] Missing env var PAYPAL_CLIENT_ID');
 if (!PAYPAL_CLIENT_SECRET) console.warn('[WARN] Missing env var PAYPAL_CLIENT_SECRET');
@@ -49,15 +49,24 @@ if (!PAYPAL_WEBHOOK_ID) console.warn('[WARN] Missing env var PAYPAL_WEBHOOK_ID')
 const BSP_PRODUCT = process.env.BSP_PRODUCT || 'BrandStampPro';
 const BSP_DEFAULT_SEATS = Number(process.env.BSP_DEFAULT_SEATS || 2);
 const BSP_DEFAULT_TIER = process.env.BSP_DEFAULT_TIER || 'standard';
-const BSP_DEFAULT_ENTITLEMENT = process.env.BSP_DEFAULT_ENTITLEMENT || '1.x'; // change if you truly intend 2.x
+const BSP_DEFAULT_ENTITLEMENT = process.env.BSP_DEFAULT_ENTITLEMENT || '1.x'; // set to 2.x only if you truly intend that
+
+// CORS (for WP Smart Buttons calling Cloud Run from the browser)
+const CORS_ALLOW_ORIGINS = (process.env.CORS_ALLOW_ORIGINS || '*')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+// -------------------- Middleware --------------------
+// IMPORTANT: Stripe webhook needs RAW body. If we parse JSON globally first, Stripe signature verify will fail.
+// Solution: apply JSON parsing to everything EXCEPT the Stripe webhook route.
+const jsonParser = express.json({ limit: '256kb' });
+app.use((req, res, next) => {
+  if (req.originalUrl === '/webhook/stripe') return next();
+  return jsonParser(req, res, next);
+});
 
 // -------------------- Helpers --------------------
-function makeLicenseKey() {
-  const a = crypto.randomBytes(4).toString('hex').toUpperCase();
-  const b = crypto.randomBytes(4).toString('hex').toUpperCase();
-  return `BSP-${a}-${b}`;
-}
-
 function nowIso() {
   return new Date().toISOString();
 }
@@ -67,11 +76,41 @@ function normalizeEmail(v) {
   return s || null;
 }
 
+function makeLicenseKey() {
+  const a = crypto.randomBytes(4).toString('hex').toUpperCase();
+  const b = crypto.randomBytes(4).toString('hex').toUpperCase();
+  return `BSP-${a}-${b}`;
+}
+
 function makePurchaseRef() {
-  // short, unique, readable
   const tail = crypto.randomBytes(3).toString('hex').toUpperCase();
   return `BSP-${Date.now()}-${tail}`;
 }
+
+function emailHash(email) {
+  if (!email) return null;
+  return crypto.createHash('sha256').update(email.toLowerCase().trim()).digest('hex');
+}
+
+function corsAllow(res, origin) {
+  // Basic allowlist; '*' means allow all.
+  const allowAll = CORS_ALLOW_ORIGINS.includes('*');
+  const ok = allowAll || (origin && CORS_ALLOW_ORIGINS.includes(origin));
+  if (!ok) return false;
+
+  res.setHeader('Access-Control-Allow-Origin', allowAll ? '*' : origin);
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+  return true;
+}
+
+// Preflight handler for CORS
+app.options('*', (req, res) => {
+  const origin = req.headers.origin;
+  corsAllow(res, origin);
+  return res.sendStatus(204);
+});
 
 async function paypalGetAccessToken() {
   const creds = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString('base64');
@@ -155,6 +194,7 @@ app.get('/status', (req, res) => {
     ts: nowIso(),
     paypalMode: PAYPAL_MODE,
     allowUnverifiedPaypal: PAYPAL_ALLOW_UNVERIFIED,
+    corsAllowOrigins: CORS_ALLOW_ORIGINS,
   });
 });
 
@@ -186,7 +226,6 @@ app.post('/verify', async (req, res) => {
 
     const maxDevices = Number(lic.maxDevices || 2);
     const devices = Array.isArray(lic.devices) ? lic.devices : [];
-
     const now = nowIso();
 
     // already activated on this machine?
@@ -213,13 +252,15 @@ app.post('/verify', async (req, res) => {
 });
 
 /**
- * PayPal Create Order (server-side)
- * Purpose: create a pending record with email + purchaseRef, then create PayPal order
- * Expects: { email, amount? }  (amount optional; you can hardcode/compute server-side)
+ * PayPal Smart Buttons: Create Order (server-side)
+ * Expects: { email, amount? }
  * Returns: { ok, orderId, purchaseRef }
  */
 app.post('/paypal/create-order', async (req, res) => {
   try {
+    const origin = req.headers.origin;
+    corsAllow(res, origin);
+
     const email = normalizeEmail(req.body?.email);
     const amountValue = String(req.body?.amount || '30.00'); // TODO: compute from SKU/pricing if needed
     const currency = 'USD';
@@ -228,7 +269,7 @@ app.post('/paypal/create-order', async (req, res) => {
 
     const purchaseRef = makePurchaseRef();
 
-    // Write pending purchase first (this is the critical bridge that fixes email:null in webhook)
+    // Write pending purchase first (critical bridge that fixes email:null in webhook)
     await firestore.collection('paypal_purchases').doc(purchaseRef).set({
       purchaseRef,
       email,
@@ -267,7 +308,7 @@ app.post('/paypal/create-order', async (req, res) => {
     if (!resp.ok) {
       const txt = await resp.text().catch(() => '');
       console.error('🔥 PayPal create order failed:', resp.status, txt);
-      // Mark pending as failed
+
       await firestore.collection('paypal_purchases').doc(purchaseRef).set({
         status: 'failed',
         error: `paypal_create_order_failed_${resp.status}`,
@@ -279,7 +320,6 @@ app.post('/paypal/create-order', async (req, res) => {
 
     const order = await resp.json();
 
-    // Store orderId on pending record
     await firestore.collection('paypal_purchases').doc(purchaseRef).set({
       orderId: order?.id || null,
       updatedAt: nowIso(),
@@ -292,10 +332,48 @@ app.post('/paypal/create-order', async (req, res) => {
   }
 });
 
+/**
+ * PayPal Smart Buttons: Capture Order (server-side)
+ * Expects: { orderId }
+ * Returns: { ok, result }
+ *
+ * NOTE: You can show success to the buyer after capture,
+ * but you should still mint/license via webhook as the source of truth.
+ */
+app.post('/paypal/capture-order', async (req, res) => {
+  try {
+    const origin = req.headers.origin;
+    corsAllow(res, origin);
+
+    const orderId = String(req.body?.orderId || '').trim();
+    if (!orderId) return res.status(400).json({ ok: false, error: 'missing_orderId' });
+
+    const accessToken = await paypalGetAccessToken();
+
+    const resp = await fetch(`${PAYPAL_BASE}/v2/checkout/orders/${encodeURIComponent(orderId)}/capture`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    const json = await resp.json().catch(() => ({}));
+
+    if (!resp.ok) {
+      console.error('🔥 PayPal capture failed:', resp.status, json);
+      return res.status(500).json({ ok: false, error: 'paypal_capture_failed', detail: json });
+    }
+
+    return res.json({ ok: true, result: json });
+  } catch (err) {
+    console.error('🔥 /paypal/capture-order error:', err);
+    return res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
 // ==================== STRIPE WEBHOOK ====================
-// IMPORTANT:
-// - Stripe requires the RAW body for signature verification.
-// - Do NOT use express.json() on this route.
+// Stripe requires the RAW body for signature verification.
 app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
   try {
     if (!stripe) {
@@ -343,7 +421,7 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
         const licenseDoc = {
           licenseKey,
           email,
-          emailHash: email ? crypto.createHash('sha256').update(email.toLowerCase().trim()).digest('hex') : null,
+          emailHash: email ? emailHash(email) : null,
           stripe: {
             provider: 'stripe',
             eventId: event.id,
@@ -356,6 +434,7 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
           },
           metadata,
           status: 'active',
+          maxDevices: BSP_DEFAULT_SEATS,
           createdAt: nowIso(),
           updatedAt: nowIso(),
           expiresAt: null,
@@ -375,7 +454,7 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
       console.log('✅ Stripe checkout.session.completed processed', {
         eventId: event.id,
         sessionId: session.id,
-        email,
+        emailPresent: !!email,
       });
     } else {
       console.log('ℹ️ Stripe event received:', event.type);
@@ -389,9 +468,7 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
 });
 
 // ==================== PAYPAL WEBHOOK ====================
-// PayPal does NOT require raw body for verification like Stripe does.
-// We parse JSON here.
-app.post('/webhook/paypal', express.json({ type: 'application/json' }), async (req, res) => {
+app.post('/webhook/paypal', async (req, res) => {
   try {
     const event = req.body || {};
     const eventId = event.id || null;
@@ -419,6 +496,7 @@ app.post('/webhook/paypal', express.json({ type: 'application/json' }), async (r
       const v = await paypalVerifyWebhookSignature(req.headers, event);
       verified = !!v.verified;
       verifyInfo = v;
+
       if (!verified && !PAYPAL_ALLOW_UNVERIFIED) {
         console.error('⚠️ PayPal signature verify failed', v);
         return res.status(400).json({ ok: false, error: 'paypal_signature_verify_failed', detail: v.reason || null });
@@ -430,7 +508,7 @@ app.post('/webhook/paypal', express.json({ type: 'application/json' }), async (r
       }
     }
 
-    // Trust only V2 capture completion (your payload is resource_version 2.0)
+    // Trust only V2 capture completion
     const shouldMint = eventType === 'PAYMENT.CAPTURE.COMPLETED';
 
     // Pull amount/currency in a tolerant way
@@ -445,20 +523,18 @@ app.post('/webhook/paypal', express.json({ type: 'application/json' }), async (r
       currency = resource.amount.currency;
     }
 
-    // IDs
     const captureId = resource?.id || null;
     const orderId =
       resource?.supplementary_data?.related_ids?.order_id ||
       resource?.parent_payment ||
       null;
 
-    // Bridge key (must be set during create-order as invoice_id/custom_id)
     const purchaseRef =
       resource?.invoice_id ||
       resource?.custom_id ||
       null;
 
-    // CAPTURE DEDUPE: PayPal may resend the same capture with a new eventId.
+    // CAPTURE DEDUPE: PayPal may resend the same capture with a new eventId
     if (captureId) {
       const capRef = firestore.collection('paypal_captures').doc(captureId);
       const capSnap = await capRef.get();
@@ -481,7 +557,7 @@ app.post('/webhook/paypal', express.json({ type: 'application/json' }), async (r
     // Fallback (often absent)
     email = email || resource?.payer?.email_address || null;
 
-    // Dedupe by PayPal event id too (still useful)
+    // Dedupe by PayPal event id too
     const eventRef = firestore.collection('paypal_events').doc(eventId);
 
     await firestore.runTransaction(async (tx) => {
@@ -496,7 +572,7 @@ app.post('/webhook/paypal', express.json({ type: 'application/json' }), async (r
         const licenseDoc = {
           licenseKey,
           email,
-          emailHash: email ? crypto.createHash('sha256').update(email.toLowerCase().trim()).digest('hex') : null,
+          emailHash: email ? emailHash(email) : null,
           paypal: {
             provider: 'paypal',
             eventId,
@@ -512,6 +588,7 @@ app.post('/webhook/paypal', express.json({ type: 'application/json' }), async (r
           },
           metadata: {},
           status: 'active',
+          maxDevices: BSP_DEFAULT_SEATS,
           createdAt: nowIso(),
           updatedAt: nowIso(),
           expiresAt: null,
@@ -519,7 +596,6 @@ app.post('/webhook/paypal', express.json({ type: 'application/json' }), async (r
 
         tx.set(firestore.collection('licenses').doc(licenseKey), licenseDoc, { merge: true });
 
-        // Mark pending purchase as paid (optional but recommended)
         if (purchaseRef) {
           tx.set(firestore.collection('paypal_purchases').doc(purchaseRef), {
             status: 'paid',
@@ -529,7 +605,6 @@ app.post('/webhook/paypal', express.json({ type: 'application/json' }), async (r
           }, { merge: true });
         }
 
-        // Capture dedupe marker
         if (captureId) {
           tx.set(firestore.collection('paypal_captures').doc(captureId), {
             captureId,
