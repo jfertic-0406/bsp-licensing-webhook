@@ -375,6 +375,9 @@ app.post('/paypal/capture-order', async (req, res) => {
 app.post('/stripe/create-checkout-session', async (req, res) => {
   try {
     const origin = req.headers.origin;
+    corsAllow(res, origin);
+
+    if (!stripe) return res.status(500).json({ ok: false, error: 'stripe_not_configured' });
     // If you have the corsAllow helper in your updated file, call it here:
     // corsAllow(res, origin);
 
@@ -698,6 +701,7 @@ app.use((req, res) => res.status(404).json({ ok: false, error: 'Not found' }));
 app.listen(PORT, () => {
   console.log(`bsp-licensing-webhook listening on ${PORT} (build ${BUILD_STAMP})`);
 });
+
 
 
 
