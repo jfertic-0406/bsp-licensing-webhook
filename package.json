@@ -9,9 +9,8 @@
     "express": "^4.19.2",
     "stripe": "^16.6.0",
     "@google-cloud/firestore": "^7.11.0",
-    "@google-cloud/storage": "^7.10.0"
+    "@google-cloud/storage": "^7.10.0",
     "postmark": "^4.0.0"
   }
 }
-
 
