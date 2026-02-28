@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const Stripe = require('stripe');
 const { Firestore } = require('@google-cloud/firestore');
 const { Storage } = require('@google-cloud/storage');
+const postmark = require('postmark');
 
 const app = express();
 
@@ -67,6 +68,12 @@ const CORS_ALLOW_ORIGINS = (process.env.CORS_ALLOW_ORIGINS || '*')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
+
+const POSTMARK_SERVER_TOKEN = process.env.POSTMARK_SERVER_TOKEN || '';
+const EMAIL_FROM = process.env.EMAIL_FROM || '';
+const EMAIL_REPLY_TO = process.env.EMAIL_REPLY_TO || '';
+
+const postmarkClient = POSTMARK_SERVER_TOKEN ? new postmark.ServerClient(POSTMARK_SERVER_TOKEN) : null;
 
 // -------------------- Middleware --------------------
 // IMPORTANT: Stripe webhook needs RAW body. If we parse JSON globally first, Stripe signature verify will fail.
@@ -839,6 +846,107 @@ app.post('/webhook/paypal', async (req, res) => {
   }
 });
 
+app.post('/recover', async (req, res) => {
+  try {
+    // Auth (WP → Cloud Run shared secret)
+    const expected = process.env.RECOVER_WEBHOOK_SECRET || '';
+    const got = String(req.headers['x-bsp-webhook-secret'] || '');
+    if (!expected || got !== expected) {
+      return res.status(403).json({ ok: false, error: 'forbidden' });
+    }
+
+    if (!postmarkClient || !EMAIL_FROM) {
+      return res.status(500).json({ ok: false, error: 'email_not_configured' });
+    }
+
+    const email = normalizeEmail(req.body?.email);
+    if (!email) return res.status(400).json({ ok: false, error: 'missing_email' });
+
+    // Find active license: emailHash, fallback to email
+    let q = await firestore.collection('licenses')
+      .where('emailHash', '==', emailHash(email))
+      .where('status', '==', 'active')
+      .limit(1)
+      .get();
+
+    if (q.empty) {
+      q = await firestore.collection('licenses')
+        .where('email', '==', email)
+        .where('status', '==', 'active')
+        .limit(1)
+        .get();
+    }
+
+    if (q.empty) {
+      // Don't leak info too much; still return ok to reduce probing
+      return res.json({ ok: true });
+    }
+
+    const licDoc = q.docs[0];
+    const licenseKey = licDoc.id;
+
+    // Create token (store only hash)
+    const token = randomToken();
+    const tokenHash = sha256Hex(token);
+
+    const now = nowIso();
+    const expiresAt = new Date(Date.now() + DOWNLOAD_TOKEN_TTL_MIN * 60 * 1000).toISOString();
+
+    await firestore.collection('download_tokens').doc(tokenHash).set({
+      tokenHash,
+      email,
+      emailHash: emailHash(email),
+      licenseKey,
+      status: 'active',
+      createdAt: now,
+      expiresAt,
+      usedAt: null,
+      source: 'recover',
+    });
+
+    const downloadUrl = `https://bsp-licensing-webhook-514781223633.us-south1.run.app/download?t=${token}`;
+
+    const subject = 'BrandStamp Pro™ — License & Secure Download Link';
+    const manualUrl = 'https://betterhomephotos.net/brandstamp-pro-users-manual/';
+
+    const textBody =
+`Here’s your BrandStamp Pro™ license and secure download link.
+
+License Key: ${licenseKey}
+
+Secure Download Link (expires in ${DOWNLOAD_TOKEN_TTL_MIN} minutes):
+${downloadUrl}
+
+User’s Manual:
+${manualUrl}
+
+Need help? Reply to this email or contact support@betterhomephotos.net
+`;
+
+    await postmarkClient.sendEmail({
+      From: EMAIL_FROM,
+      To: email,
+      ReplyTo: EMAIL_REPLY_TO || undefined,
+      Subject: subject,
+      TextBody: textBody,
+      MessageStream: 'outbound',
+    });
+
+    // Optional log
+    await firestore.collection('email_sends').add({
+      type: 'recover',
+      to: email,
+      licenseKey,
+      createdAt: nowIso(),
+    });
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('🔥 /recover error:', err);
+    return res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
 // For any accidental hits to unknown paths
 app.use((req, res) => res.status(404).json({ ok: false, error: 'Not found' }));
 
@@ -846,6 +954,7 @@ app.use((req, res) => res.status(404).json({ ok: false, error: 'Not found' }));
 app.listen(PORT, () => {
   console.log(`bsp-licensing-webhook listening on ${PORT} (build ${BUILD_STAMP})`);
 });
+
 
 
 
