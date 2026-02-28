@@ -228,18 +228,27 @@ app.post('/download/request', async (req, res) => {
     if (!email) return res.status(400).json({ ok: false, error: 'missing_email' });
 
     // Find an active license for this email
-    const q = await firestore.collection('licenses')
-      .where('emailHash', '==', emailHash(email))
-      .where('status', '==', 'active')
-      .limit(1)
-      .get();
+    let q = await firestore.collection('licenses')
+  .where('emailHash', '==', emailHash(email))
+  .where('status', '==', 'active')
+  .limit(1)
+  .get();
 
-    if (q.empty) {
-      return res.status(404).json({ ok: false, error: 'license_not_found' });
-    }
+// Fallback for older licenses that may not have emailHash populated
+if (q.empty) {
+  q = await firestore.collection('licenses')
+    .where('email', '==', email)
+    .where('status', '==', 'active')
+    .limit(1)
+    .get();
+}
 
-    const licDoc = q.docs[0];
-    const licenseKey = licDoc.id;
+if (q.empty) {
+  return res.status(404).json({ ok: false, error: 'license_not_found' });
+}
+
+const licDoc = q.docs[0];
+const licenseKey = licDoc.id;
 
     // Store only token hash in Firestore
     const token = randomToken();
@@ -837,6 +846,7 @@ app.use((req, res) => res.status(404).json({ ok: false, error: 'Not found' }));
 app.listen(PORT, () => {
   console.log(`bsp-licensing-webhook listening on ${PORT} (build ${BUILD_STAMP})`);
 });
+
 
 
 
