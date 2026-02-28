@@ -13,7 +13,7 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 
 // Change this every commit so /status proves you’re on the latest revision
-const BUILD_STAMP = '2026-02-27-02';
+const BUILD_STAMP = '2026-02-28-02';
 
 // Stripe env vars
 const STRIPE_SECRET = process.env.STRIPE_SECRET;                   // sk_test_... or sk_live_...
@@ -954,6 +954,7 @@ app.use((req, res) => res.status(404).json({ ok: false, error: 'Not found' }));
 app.listen(PORT, () => {
   console.log(`bsp-licensing-webhook listening on ${PORT} (build ${BUILD_STAMP})`);
 });
+
 
 
 
