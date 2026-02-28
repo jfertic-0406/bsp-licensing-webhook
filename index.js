@@ -4,6 +4,7 @@ const express = require('express');
 const crypto = require('crypto');
 const Stripe = require('stripe');
 const { Firestore } = require('@google-cloud/firestore');
+const { Storage } = require('@google-cloud/storage');
 
 const app = express();
 
@@ -25,6 +26,16 @@ const stripe = STRIPE_SECRET ? Stripe(STRIPE_SECRET) : null;
 
 // Firestore (Cloud Run uses Service Account automatically via ADC)
 const firestore = new Firestore();
+
+const storage = new Storage();
+
+// Download target (your “latest” object)
+const GCS_BUCKET = process.env.GCS_BUCKET || 'betterhomephotos-bsp';
+const GCS_OBJECT = process.env.GCS_OBJECT || 'releases/BrandStampPro_latest.lrplugin.zip';
+
+// Token + URL TTLs
+const DOWNLOAD_TOKEN_TTL_MIN = Number(process.env.DOWNLOAD_TOKEN_TTL_MIN || 30); // portal token
+const SIGNED_URL_TTL_MIN = Number(process.env.SIGNED_URL_TTL_MIN || 15);         // signed url
 
 // PayPal env vars
 const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID || '';
@@ -67,6 +78,32 @@ app.use((req, res, next) => {
 });
 
 // -------------------- Helpers --------------------
+
+function randomToken() {
+  return crypto.randomBytes(32).toString('hex'); // 64 chars
+}
+
+function sha256Hex(s) {
+  return crypto.createHash('sha256').update(String(s)).digest('hex');
+}
+
+function minutesFromNow(min) {
+  return Date.now() + (min * 60 * 1000);
+}
+
+async function makeSignedDownloadUrl() {
+  const file = storage.bucket(GCS_BUCKET).file(GCS_OBJECT);
+
+  const [url] = await file.getSignedUrl({
+    version: 'v4',
+    action: 'read',
+    expires: minutesFromNow(SIGNED_URL_TTL_MIN),
+    responseDisposition: `attachment; filename="${GCS_OBJECT.split('/').pop()}"`,
+  });
+
+  return url;
+}
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -182,6 +219,105 @@ async function paypalVerifyWebhookSignature(reqHeaders, rawEventBody) {
 }
 
 // -------------------- Routes --------------------
+app.post('/download/request', async (req, res) => {
+  try {
+    const origin = req.headers.origin;
+    corsAllow(res, origin);
+
+    const email = normalizeEmail(req.body?.email);
+    if (!email) return res.status(400).json({ ok: false, error: 'missing_email' });
+
+    // Find an active license for this email
+    const q = await firestore.collection('licenses')
+      .where('emailHash', '==', emailHash(email))
+      .where('status', '==', 'active')
+      .limit(1)
+      .get();
+
+    if (q.empty) {
+      return res.status(404).json({ ok: false, error: 'license_not_found' });
+    }
+
+    const licDoc = q.docs[0];
+    const licenseKey = licDoc.id;
+
+    // Store only token hash in Firestore
+    const token = randomToken();
+    const tokenHash = sha256Hex(token);
+
+    const now = nowIso();
+    const expiresAt = new Date(Date.now() + DOWNLOAD_TOKEN_TTL_MIN * 60 * 1000).toISOString();
+
+    await firestore.collection('download_tokens').doc(tokenHash).set({
+      tokenHash,
+      email,
+      emailHash: emailHash(email),
+      licenseKey,
+      status: 'active',
+      createdAt: now,
+      expiresAt,
+      usedAt: null,
+    });
+
+    const downloadUrl = `https://bsp-licensing-webhook-514781223633.us-south1.run.app/download?t=${token}`;
+
+    // For now return it so YOU can test. Later you'll email this link.
+    return res.json({ ok: true, downloadUrl });
+  } catch (err) {
+    console.error('🔥 /download/request error:', err);
+    return res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
+app.get('/download', async (req, res) => {
+  try {
+    const token = String(req.query?.t || '').trim();
+    if (!token || token.length < 40) {
+      return res.status(400).type('text/plain').send('Invalid download token.');
+    }
+
+    const tokenHash = sha256Hex(token);
+
+    const ref = firestore.collection('download_tokens').doc(tokenHash);
+    const snap = await ref.get();
+
+    if (!snap.exists) {
+      return res.status(404).type('text/plain').send('Download token not found.');
+    }
+
+    const tok = snap.data() || {};
+    if ((tok.status || 'active') !== 'active') {
+      return res.status(403).type('text/plain').send('Download token is no longer active.');
+    }
+
+    const expiresAt = Date.parse(tok.expiresAt || '');
+    if (!expiresAt || Date.now() > expiresAt) {
+      await ref.set({ status: 'expired' }, { merge: true });
+      return res.status(403).type('text/plain').send('Download token has expired.');
+    }
+
+    // Ensure license still active
+    const licSnap = await firestore.collection('licenses').doc(tok.licenseKey).get();
+    if (!licSnap.exists) {
+      return res.status(403).type('text/plain').send('License not found.');
+    }
+    const lic = licSnap.data() || {};
+    if ((lic.status || 'active') !== 'active') {
+      return res.status(403).type('text/plain').send('License is not active.');
+    }
+
+    // Mark token used (optional)
+    await ref.set({ usedAt: nowIso() }, { merge: true });
+
+    // Create short-lived signed URL and redirect
+    const signedUrl = await makeSignedDownloadUrl();
+    return res.redirect(302, signedUrl);
+  } catch (err) {
+    console.error('🔥 /download error:', err);
+    return res.status(500).type('text/plain').send('Server error generating download link.');
+  }
+});
+
 app.get('/', (req, res) => {
   res.type('text/plain').send('bsp-licensing-webhook ok');
 });
@@ -701,6 +837,7 @@ app.use((req, res) => res.status(404).json({ ok: false, error: 'Not found' }));
 app.listen(PORT, () => {
   console.log(`bsp-licensing-webhook listening on ${PORT} (build ${BUILD_STAMP})`);
 });
+
 
 
 
