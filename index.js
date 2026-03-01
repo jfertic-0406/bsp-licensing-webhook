@@ -386,9 +386,9 @@ app.post('/download/request', async (req, res) => {
 app.get('/download', async (req, res) => {
   try {
     const token = String(req.query?.t || '').trim();
-    if (!token || token.length < 40) {
-      return res.status(400).type('text/plain').send('Invalid download token.');
-    }
+if (!/^[a-f0-9]{64}$/i.test(token)) {
+  return res.status(400).type('text/plain').send('Invalid download token.');
+}
 
     const tokenHash = sha256Hex(token);
 
@@ -1067,6 +1067,7 @@ app.use((req, res) => res.status(404).json({ ok: false, error: 'Not found' }));
 app.listen(PORT, () => {
   console.log(`bsp-licensing-webhook listening on ${PORT} (build ${BUILD_STAMP})`);
 });
+
 
 
 
