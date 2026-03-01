@@ -13,7 +13,7 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 
 // Change this every commit so /status proves you’re on the latest revision
-const BUILD_STAMP = '2026-02-28-02';
+const BUILD_STAMP = '2026-03-01-01';
 
 // Stripe env vars
 const STRIPE_SECRET = process.env.STRIPE_SECRET;                   // sk_test_... or sk_live_...
@@ -28,15 +28,18 @@ const stripe = STRIPE_SECRET ? Stripe(STRIPE_SECRET) : null;
 // Firestore (Cloud Run uses Service Account automatically via ADC)
 const firestore = new Firestore();
 
+// GCS
 const storage = new Storage();
-
-// Download target (your “latest” object)
 const GCS_BUCKET = process.env.GCS_BUCKET || 'betterhomephotos-bsp';
 const GCS_OBJECT = process.env.GCS_OBJECT || 'releases/BrandStampPro_latest.lrplugin.zip';
 
 // Token + URL TTLs
 const DOWNLOAD_TOKEN_TTL_MIN = Number(process.env.DOWNLOAD_TOKEN_TTL_MIN || 30); // portal token
 const SIGNED_URL_TTL_MIN = Number(process.env.SIGNED_URL_TTL_MIN || 15);         // signed url
+
+// Download token consumption policy
+// 1 = single-use, 2 = "double-click grace"
+const DOWNLOAD_TOKEN_MAX_USES = Number(process.env.DOWNLOAD_TOKEN_MAX_USES || 2);
 
 // PayPal env vars
 const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID || '';
@@ -69,11 +72,14 @@ const CORS_ALLOW_ORIGINS = (process.env.CORS_ALLOW_ORIGINS || '*')
   .map(s => s.trim())
   .filter(Boolean);
 
+// Postmark
 const POSTMARK_SERVER_TOKEN = process.env.POSTMARK_SERVER_TOKEN || '';
 const EMAIL_FROM = process.env.EMAIL_FROM || '';
 const EMAIL_REPLY_TO = process.env.EMAIL_REPLY_TO || '';
-
 const postmarkClient = POSTMARK_SERVER_TOKEN ? new postmark.ServerClient(POSTMARK_SERVER_TOKEN) : null;
+
+// Recover webhook secret (WP → Cloud Run shared secret)
+const RECOVER_WEBHOOK_SECRET = process.env.RECOVER_WEBHOOK_SECRET || '';
 
 // -------------------- Middleware --------------------
 // IMPORTANT: Stripe webhook needs RAW body. If we parse JSON globally first, Stripe signature verify will fail.
@@ -85,30 +91,20 @@ app.use((req, res, next) => {
 });
 
 // -------------------- Helpers --------------------
-
-function randomToken() {
-  return crypto.randomBytes(32).toString('hex'); // 64 chars
+function sha256(s) {
+  return crypto.createHash('sha256').update(String(s || '')).digest('hex');
 }
 
 function sha256Hex(s) {
   return crypto.createHash('sha256').update(String(s)).digest('hex');
 }
 
-function minutesFromNow(min) {
-  return Date.now() + (min * 60 * 1000);
+function randomToken() {
+  return crypto.randomBytes(32).toString('hex'); // 64 chars
 }
 
-async function makeSignedDownloadUrl() {
-  const file = storage.bucket(GCS_BUCKET).file(GCS_OBJECT);
-
-  const [url] = await file.getSignedUrl({
-    version: 'v4',
-    action: 'read',
-    expires: minutesFromNow(SIGNED_URL_TTL_MIN),
-    responseDisposition: `attachment; filename="${GCS_OBJECT.split('/').pop()}"`,
-  });
-
-  return url;
+function minutesFromNow(min) {
+  return Date.now() + (min * 60 * 1000);
 }
 
 function nowIso() {
@@ -136,6 +132,32 @@ function emailHash(email) {
   return crypto.createHash('sha256').update(email.toLowerCase().trim()).digest('hex');
 }
 
+function getClientIp(req) {
+  // Works behind Cloud Run / load balancers (best-effort)
+  const xff = req.headers['x-forwarded-for'];
+  if (xff && typeof xff === 'string') return xff.split(',')[0].trim();
+  if (Array.isArray(xff) && xff.length) return String(xff[0]).trim();
+  return req.ip || req.connection?.remoteAddress || 'unknown';
+}
+
+function envInt(name, fallback) {
+  const v = parseInt(process.env[name], 10);
+  return Number.isFinite(v) ? v : fallback;
+}
+
+async function makeSignedDownloadUrl() {
+  const file = storage.bucket(GCS_BUCKET).file(GCS_OBJECT);
+
+  const [url] = await file.getSignedUrl({
+    version: 'v4',
+    action: 'read',
+    expires: minutesFromNow(SIGNED_URL_TTL_MIN),
+    responseDisposition: `attachment; filename="${GCS_OBJECT.split('/').pop()}"`,
+  });
+
+  return url;
+}
+
 function corsAllow(res, origin) {
   // Basic allowlist; '*' means allow all.
   const allowAll = CORS_ALLOW_ORIGINS.includes('*');
@@ -156,6 +178,80 @@ app.options('*', (req, res) => {
   return res.sendStatus(204);
 });
 
+// -------------------- Recover Rate Limiting (Firestore-backed) --------------------
+async function bumpWindowCounter({ db, key, max, windowMin }) {
+  const now = Date.now();
+  const windowMs = windowMin * 60 * 1000;
+  const bucket = Math.floor(now / windowMs); // rolling bucket per window
+  const docId = `${key}_${bucket}`;
+
+  const ref = db.collection('recover_throttle').doc(docId);
+
+  const out = await db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    const data = snap.exists ? snap.data() : null;
+    const count = (data?.count || 0) + 1;
+
+    // We avoid serverTimestamp dependencies; ISO timestamps are fine here.
+    const patch = {
+      key,
+      bucket,
+      count,
+      lastAttempt: nowIso(),
+      createdAt: data?.createdAt || nowIso(),
+    };
+
+    tx.set(ref, patch, { merge: true });
+
+    if (count > max) return { allowed: false, count };
+    return { allowed: true, count };
+  });
+
+  return out;
+}
+
+function recoverRateLimitMiddleware(db) {
+  const emailMax = envInt('RECOVER_RL_EMAIL_MAX', 3);
+  const emailWindowMin = envInt('RECOVER_RL_EMAIL_WINDOW_MIN', 30);
+  const ipMax = envInt('RECOVER_RL_IP_MAX', 10);
+  const ipWindowMin = envInt('RECOVER_RL_IP_WINDOW_MIN', 30);
+
+  return async function (req, res, next) {
+    try {
+      const emailRaw = (req.body?.email || '').trim().toLowerCase();
+      const ipRaw = getClientIp(req);
+
+      if (!emailRaw) return next();
+
+      const eHash = sha256(emailRaw);
+      const iHash = sha256(ipRaw);
+
+      const [emailCheck, ipCheck] = await Promise.all([
+        bumpWindowCounter({ db, key: `email_${eHash}`, max: emailMax, windowMin: emailWindowMin }),
+        bumpWindowCounter({ db, key: `ip_${iHash}`, max: ipMax, windowMin: ipWindowMin }),
+      ]);
+
+      if (!emailCheck.allowed || !ipCheck.allowed) {
+        return res.status(429).json({
+          ok: false,
+          error: 'Too many recovery attempts. Please wait a bit and try again.',
+        });
+      }
+
+      req.bsp = req.bsp || {};
+      req.bsp.emailHash = eHash;
+      req.bsp.ipHash = iHash;
+
+      return next();
+    } catch (err) {
+      // Fail-open: don't block customers if Firestore hiccups
+      console.error('recover rate limit error', err);
+      return next();
+    }
+  };
+}
+
+// -------------------- PayPal helpers --------------------
 async function paypalGetAccessToken() {
   const creds = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString('base64');
 
@@ -236,26 +332,26 @@ app.post('/download/request', async (req, res) => {
 
     // Find an active license for this email
     let q = await firestore.collection('licenses')
-  .where('emailHash', '==', emailHash(email))
-  .where('status', '==', 'active')
-  .limit(1)
-  .get();
+      .where('emailHash', '==', emailHash(email))
+      .where('status', '==', 'active')
+      .limit(1)
+      .get();
 
-// Fallback for older licenses that may not have emailHash populated
-if (q.empty) {
-  q = await firestore.collection('licenses')
-    .where('email', '==', email)
-    .where('status', '==', 'active')
-    .limit(1)
-    .get();
-}
+    // Fallback for older licenses that may not have emailHash populated
+    if (q.empty) {
+      q = await firestore.collection('licenses')
+        .where('email', '==', email)
+        .where('status', '==', 'active')
+        .limit(1)
+        .get();
+    }
 
-if (q.empty) {
-  return res.status(404).json({ ok: false, error: 'license_not_found' });
-}
+    if (q.empty) {
+      return res.status(404).json({ ok: false, error: 'license_not_found' });
+    }
 
-const licDoc = q.docs[0];
-const licenseKey = licDoc.id;
+    const licDoc = q.docs[0];
+    const licenseKey = licDoc.id;
 
     // Store only token hash in Firestore
     const token = randomToken();
@@ -273,6 +369,8 @@ const licenseKey = licDoc.id;
       createdAt: now,
       expiresAt,
       usedAt: null,
+      useCount: 0,
+      source: 'download_request',
     });
 
     const downloadUrl = `https://bsp-licensing-webhook-514781223633.us-south1.run.app/download?t=${token}`;
@@ -312,6 +410,13 @@ app.get('/download', async (req, res) => {
       return res.status(403).type('text/plain').send('Download token has expired.');
     }
 
+    // Enforce limited use (default: 2-use grace)
+    const useCount = Number(tok.useCount || 0);
+    if (useCount >= DOWNLOAD_TOKEN_MAX_USES) {
+      await ref.set({ status: 'consumed' }, { merge: true });
+      return res.status(403).type('text/plain').send('Download token has already been used.');
+    }
+
     // Ensure license still active
     const licSnap = await firestore.collection('licenses').doc(tok.licenseKey).get();
     if (!licSnap.exists) {
@@ -322,8 +427,11 @@ app.get('/download', async (req, res) => {
       return res.status(403).type('text/plain').send('License is not active.');
     }
 
-    // Mark token used (optional)
-    await ref.set({ usedAt: nowIso() }, { merge: true });
+    // Mark token used + bump useCount
+    await ref.set({
+      usedAt: nowIso(),
+      useCount: useCount + 1,
+    }, { merge: true });
 
     // Create short-lived signed URL and redirect
     const signedUrl = await makeSignedDownloadUrl();
@@ -530,10 +638,6 @@ app.post('/stripe/create-checkout-session', async (req, res) => {
     corsAllow(res, origin);
 
     if (!stripe) return res.status(500).json({ ok: false, error: 'stripe_not_configured' });
-    // If you have the corsAllow helper in your updated file, call it here:
-    // corsAllow(res, origin);
-
-    if (!stripe) return res.status(500).json({ ok: false, error: 'stripe_not_configured' });
 
     const email = String(req.body?.email || '').trim().toLowerCase();
     if (!email) return res.status(400).json({ ok: false, error: 'missing_email' });
@@ -543,7 +647,7 @@ app.post('/stripe/create-checkout-session', async (req, res) => {
 
     const siteUrl = process.env.SITE_URL || 'https://betterhomephotos.net';
     const successUrl = `${siteUrl}/bsp-thank-you/?provider=stripe&session_id={CHECKOUT_SESSION_ID}`;
-    const cancelUrl  = `${siteUrl}/lightroom-classic-branding-plugin/?cancelled=1`;
+    const cancelUrl = `${siteUrl}/lightroom-classic-branding-plugin/?cancelled=1`;
 
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
@@ -846,18 +950,18 @@ app.post('/webhook/paypal', async (req, res) => {
   }
 });
 
-app.post('/recover', async (req, res) => {
+// ==================== RECOVER (WP → Cloud Run) ====================
+app.post('/recover', recoverRateLimitMiddleware(firestore), async (req, res) => {
   try {
     // Auth (WP → Cloud Run shared secret)
-    const expected = process.env.RECOVER_WEBHOOK_SECRET || '';
+    const expected = RECOVER_WEBHOOK_SECRET || '';
     const got = String(req.headers['x-bsp-webhook-secret'] || '');
     if (!expected || got !== expected) {
       return res.status(403).json({ ok: false, error: 'forbidden' });
     }
 
-    if (!postmarkClient || !EMAIL_FROM) {
-      return res.status(500).json({ ok: false, error: 'email_not_configured' });
-    }
+    const debugMode = String(req.headers['x-bsp-debug'] || '') === '1';
+    const canEmail = !!(postmarkClient && EMAIL_FROM);
 
     const email = normalizeEmail(req.body?.email);
     if (!email) return res.status(400).json({ ok: false, error: 'missing_email' });
@@ -901,10 +1005,16 @@ app.post('/recover', async (req, res) => {
       createdAt: now,
       expiresAt,
       usedAt: null,
+      useCount: 0,
       source: 'recover',
     });
 
     const downloadUrl = `https://bsp-licensing-webhook-514781223633.us-south1.run.app/download?t=${token}`;
+
+    // Debug mode: return the goods so you can test end-to-end without Postmark
+    if (debugMode) {
+      return res.json({ ok: true, licenseKey, downloadUrl });
+    }
 
     const subject = 'BrandStamp Pro™ — License & Secure Download Link';
     const manualUrl = 'https://betterhomephotos.net/brandstamp-pro-users-manual/';
@@ -923,22 +1033,25 @@ ${manualUrl}
 Need help? Reply to this email or contact support@betterhomephotos.net
 `;
 
-    await postmarkClient.sendEmail({
-      From: EMAIL_FROM,
-      To: email,
-      ReplyTo: EMAIL_REPLY_TO || undefined,
-      Subject: subject,
-      TextBody: textBody,
-      MessageStream: 'outbound',
-    });
+    if (canEmail) {
+      await postmarkClient.sendEmail({
+        From: EMAIL_FROM,
+        To: email,
+        ReplyTo: EMAIL_REPLY_TO || undefined,
+        Subject: subject,
+        TextBody: textBody,
+        MessageStream: 'outbound',
+      });
 
-    // Optional log
-    await firestore.collection('email_sends').add({
-      type: 'recover',
-      to: email,
-      licenseKey,
-      createdAt: nowIso(),
-    });
+      await firestore.collection('email_sends').add({
+        type: 'recover',
+        to: email,
+        licenseKey,
+        createdAt: nowIso(),
+      });
+    } else {
+      console.warn('⚠️ /recover: email not configured; skipping email send');
+    }
 
     return res.json({ ok: true });
   } catch (err) {
