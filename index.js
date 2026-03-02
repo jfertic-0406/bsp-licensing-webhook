@@ -1016,21 +1016,29 @@ app.post('/recover', recoverRateLimitMiddleware(firestore), async (req, res) => 
       return res.json({ ok: true, licenseKey, downloadUrl });
     }
 
-    const subject = 'BrandStamp Pro™ — License & Secure Download Link';
-    const manualUrl = 'https://betterhomephotos.net/brandstamp-pro-users-manual/';
+    const subject = "BrandStamp Pro™ — License Key + Download";
 
-    const textBody =
-`Here’s your BrandStamp Pro™ license and secure download link.
+const recoverUrl = "https://betterhomephotos.net/recover-license/";
+const manualUrl  = "https://betterhomephotos.net/brandstamp-pro-manual/";
+
+const textBody =
+`Here’s your BrandStamp Pro™ license key and download instructions.
 
 License Key: ${licenseKey}
+Licenses allow activation on 2 computers (desktop + laptop).
 
-Secure Download Link (expires in ${DOWNLOAD_TOKEN_TTL_MIN} minutes):
+Download / Updates (recommended):
+${recoverUrl}
+(For security, downloads are delivered through betterhomephotos.net and links expire.)
+
+Secure Direct Download Link (expires in ${DOWNLOAD_TOKEN_TTL_MIN} minutes):
 ${downloadUrl}
 
-User’s Manual:
+User Manual / Setup Guide:
 ${manualUrl}
 
 Need help? Reply to this email or contact support@betterhomephotos.net
+Tip: include a screenshot of the full Export window (panel + preview visible).
 `;
 
     if (canEmail) {
@@ -1067,6 +1075,7 @@ app.use((req, res) => res.status(404).json({ ok: false, error: 'Not found' }));
 app.listen(PORT, () => {
   console.log(`bsp-licensing-webhook listening on ${PORT} (build ${BUILD_STAMP})`);
 });
+
 
 
 
